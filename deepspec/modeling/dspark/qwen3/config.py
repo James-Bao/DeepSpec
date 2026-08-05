@@ -6,10 +6,17 @@ from deepspec.modeling.dspark.common import validate_target_layer_ids
 TRAIN_ATTN_IMPLEMENTATION = "flex_attention"
 
 
+def _resolve_text_config(target_config):
+    if str(target_config.model_type) in ("qwen3_5", "qwen3_5_moe"):
+        return target_config.text_config
+    return target_config
+
+
 def build_draft_config(
     target_config,
     model_args,
 ):
+    target_config = _resolve_text_config(target_config)
     num_target_layers = int(target_config.num_hidden_layers)
     num_draft_layers = int(model_args.num_draft_layers)
     layer_types = ["full_attention"] * num_draft_layers
