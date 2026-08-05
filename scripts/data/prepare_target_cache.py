@@ -54,18 +54,20 @@ class TargetForwardResult:
 
 def _get_target_backbone(target_model):
     model_type = str(target_model.config.model_type)
-    if model_type in ("gemma4", "gemma4_unified"):
+    if model_type in ("gemma4", "gemma4_unified", "qwen3_5", "qwen3_5_moe"):
         if hasattr(target_model, "language_model"):
             return target_model.language_model
         if hasattr(target_model, "model") and hasattr(target_model.model, "language_model"):
             return target_model.model.language_model
-        assert False, "Gemma4 target model must expose a text language_model."
+        if hasattr(target_model, "model") and hasattr(target_model.model, "layers"):
+            return target_model.model
+        assert False, f"{model_type} target model must expose a text language_model."
     return getattr(target_model, "model", target_model)
 
 
 def _get_target_hidden_size(target_model) -> int:
     model_type = str(target_model.config.model_type)
-    if model_type in ("gemma4", "gemma4_unified"):
+    if model_type in ("gemma4", "gemma4_unified", "qwen3_5", "qwen3_5_moe"):
         return int(target_model.config.text_config.hidden_size)
     return int(target_model.config.hidden_size)
 
