@@ -2,6 +2,7 @@ import argparse
 from dataclasses import dataclass
 import json
 import os
+import time
 
 import torch
 import torch.distributed as dist
@@ -82,6 +83,15 @@ def _get_hook_tensor(output):
     raise TypeError(f"Unsupported target hook output type: {type(output)!r}")
 
 
+def _select_attn_implementation():
+    """Prefer flash_attention_2 for speed; fall back to sdpa."""
+    try:
+        import flash_attn  # noqa: F401
+        return "flash_attention_2"
+    except ImportError:
+        return "sdpa"
+
+
 def run_target_forward_with_hooks(
     *,
     target_model,
@@ -151,6 +161,16 @@ def parse_args():
     parser.add_argument("--max-shard-bytes", type=int, default=64 * 1024**3)
     parser.add_argument("--local-batch-size", type=int, default=32)
     parser.add_argument("--num-workers", type=int, default=4)
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="Resume from a previous interrupted run. Skips already-processed samples.",
+    )
+    parser.add_argument(
+        "--compile",
+        action="store_true",
+        help="Apply torch.compile to the target model for faster forward passes.",
+    )
     cli_args = parser.parse_args()
     config = parse_opts_to_config(cli_args.opts, load_config(cli_args.config))
     return cli_args, config
@@ -201,11 +221,127 @@ def _write_manifest(
     write_target_cache_manifest(output_dir=output_dir, manifest=manifest)
 
 
-def _print_prepare_progress(*, global_rank: int, processed_samples: int, total_samples: int):
+def _print_prepare_progress(
+    *, global_rank: int, processed_samples: int, total_samples: int,
+    elapsed: float, resumed_samples: int = 0,
+):
+    rate = processed_samples / max(elapsed, 1e-6)
+    remaining = (total_samples - processed_samples - resumed_samples) / max(rate, 1e-6)
     print(
-        f"[prepare rank {global_rank}] {processed_samples}/{total_samples} samples",
+        f"[prepare rank {global_rank}] "
+        f"{processed_samples + resumed_samples}/{total_samples} samples "
+        f"({rate:.1f} samples/s, ~{remaining:.0f}s remaining)",
         flush=True,
     )
+
+
+# --- Resume helpers ---
+
+PROGRESS_FILE = "progress.json"
+
+
+def _load_resume_progress(rank_dir: str):
+    """Load shard-boundary checkpoint. Returns (num_completed_samples, shard_files)."""
+    progress_path = os.path.join(rank_dir, PROGRESS_FILE)
+    if not os.path.exists(progress_path):
+        return 0, []
+    with open(progress_path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    return int(data["num_completed_samples"]), list(data["completed_shard_files"])
+
+
+def _save_resume_progress(rank_dir: str, num_completed_samples: int, shard_files: list):
+    """Save shard-boundary checkpoint atomically."""
+    atomic_json_dump(
+        {
+            "num_completed_samples": num_completed_samples,
+            "completed_shard_files": list(shard_files),
+        },
+        os.path.join(rank_dir, PROGRESS_FILE),
+    )
+
+
+def _create_writer(
+    *,
+    rank_dir: str,
+    max_shard_bytes: int,
+    local_batch_size: int,
+    resume_samples: int,
+    resume_shard_files: list,
+):
+    """Create an AsyncTargetCacheWriter, patching state for resume."""
+    from deepspec.data.target_cache_dataset import INDEX_RECORD_SIZE
+
+    writer = AsyncTargetCacheWriter(
+        rank_dir=rank_dir,
+        max_shard_bytes=max_shard_bytes,
+        max_queue_size=local_batch_size * 4,
+    )
+
+    if resume_samples > 0:
+        # The inner LocalTargetCacheWriter opened index in "wb" (truncating).
+        # We need to re-open in append mode and restore shard numbering.
+        inner = writer.writer
+        inner.index_handle.close()
+        # Truncate the local index to match resumed samples (each record is fixed size).
+        local_index_path = inner.local_index_path
+        expected_index_size = resume_samples * INDEX_RECORD_SIZE
+        if os.path.exists(local_index_path):
+            current_size = os.path.getsize(local_index_path)
+            if current_size > expected_index_size:
+                with open(local_index_path, "r+b") as f:
+                    f.truncate(expected_index_size)
+        inner.index_handle = open(local_index_path, "ab")
+        # Restore shard state: set shard_id so next shard continues numbering.
+        inner.local_shard_files = list(resume_shard_files)
+        inner.current_shard_id = len(resume_shard_files) - 1
+        inner.num_local_samples = resume_samples
+        # Also update the async wrapper's counter so sample_id continues correctly.
+        writer.num_local_samples = resume_samples
+
+    return writer
+
+
+class _ResumeTracker:
+    """Tracks shard-boundary checkpoints during cache preparation."""
+
+    def __init__(self, rank_dir: str, writer: AsyncTargetCacheWriter,
+                 resume_shard_count: int):
+        self._rank_dir = rank_dir
+        self._writer = writer
+        self._last_sealed_count = resume_shard_count
+
+    def checkpoint_if_shard_sealed(self):
+        """Save progress when a new shard has been sealed."""
+        inner = self._writer.writer
+        current_shard_count = len(inner.local_shard_files)
+        # Current shard is still open; sealed = all except the last (if it has data).
+        if inner.current_shard_size > 0:
+            sealed_count = current_shard_count - 1
+        else:
+            sealed_count = current_shard_count
+
+        if sealed_count > self._last_sealed_count:
+            completed_shards = inner.local_shard_files[:sealed_count]
+            _save_resume_progress(
+                self._rank_dir,
+                inner.num_local_samples,
+                list(completed_shards),
+            )
+            self._last_sealed_count = sealed_count
+
+
+def _prepare_output_dir_for_resume(output_dir: str, world_size: int):
+    """Validate that the output dir is suitable for resume."""
+    if not os.path.exists(output_dir):
+        raise FileNotFoundError(
+            f"Cannot resume: output dir does not exist: {output_dir}"
+        )
+    tmp_dir = os.path.join(output_dir, "_tmp")
+    if not os.path.exists(tmp_dir):
+        raise FileNotFoundError(
+            f"Cannot resume: _tmp dir does not exist: {tmp_dir}"
+        )
 
 
 def main(local_rank: int):
@@ -216,6 +352,8 @@ def main(local_rank: int):
     seed_all(int(config.seed))
     device, global_rank, world_size = init_dist(local_rank)
     output_dir = os.path.abspath(cli_args.output_dir)
+    resuming = bool(cli_args.resume)
+
     print_on_local_main(json.dumps(config, indent=4, cls=CustomJSONEncoder), flush=True)
     print_on_local_main(
         json.dumps(
@@ -227,17 +365,38 @@ def main(local_rank: int):
                 "max_shard_bytes": int(cli_args.max_shard_bytes),
                 "local_batch_size": int(cli_args.local_batch_size),
                 "num_workers": int(cli_args.num_workers),
+                "resume": resuming,
+                "compile": bool(cli_args.compile),
             },
             indent=4,
         ),
         flush=True,
     )
-    if global_rank == 0:
-        prepare_target_cache_output_dir(output_dir)
-    dist.barrier()
+
+    # --- Output directory setup ---
+    if resuming:
+        if global_rank == 0:
+            _prepare_output_dir_for_resume(output_dir, world_size)
+        dist.barrier()
+    else:
+        if global_rank == 0:
+            prepare_target_cache_output_dir(output_dir)
+        dist.barrier()
 
     rank_dir = os.path.join(output_dir, "_tmp", f"rank_{global_rank}")
     os.makedirs(rank_dir, exist_ok=True)
+
+    # --- Resume state ---
+    resume_samples = 0
+    resume_shard_files = []
+    if resuming:
+        resume_samples, resume_shard_files = _load_resume_progress(rank_dir)
+        if resume_samples > 0:
+            print(
+                f"[rank {global_rank}] Resuming from sample {resume_samples} "
+                f"({len(resume_shard_files)} sealed shards)",
+                flush=True,
+            )
 
     with main_process_first():
         dataset = JsonLineDataset(data_paths=train_data_paths)
@@ -249,15 +408,34 @@ def main(local_rank: int):
     )
     local_total_samples = local_end - local_start
 
-    local_subset = Subset(dataset, range(local_start, local_end))
+    # Skip already-processed samples on resume.
+    effective_start = local_start + resume_samples
+    if effective_start >= local_end:
+        print(
+            f"[rank {global_rank}] All samples already processed, skipping forward pass.",
+            flush=True,
+        )
+        # Still need to participate in barriers below.
+        effective_start = local_end
+
+    local_subset = Subset(dataset, range(effective_start, local_end))
     tokenizer = AutoTokenizer.from_pretrained(
         config.model.target_model_name_or_path,
     )
+
+    attn_impl = _select_attn_implementation()
+    print_on_local_main(f"Using attention implementation: {attn_impl}", flush=True)
+
     target_model = AutoModel.from_pretrained(
         config.model.target_model_name_or_path,
         dtype=torch.bfloat16,
-        attn_implementation="sdpa",
+        attn_implementation=attn_impl,
     ).to(device=device).eval()
+
+    if cli_args.compile:
+        print_on_local_main("Compiling target model with torch.compile...", flush=True)
+        target_model = torch.compile(target_model, mode="reduce-overhead")
+
     target_hidden_size = _get_target_hidden_size(target_model)
     train_collator = ConversationCollator(
         tokenizer=tokenizer,
@@ -272,25 +450,36 @@ def main(local_rank: int):
         num_workers=int(cli_args.num_workers),
         pin_memory=True,
         drop_last=False,
+        prefetch_factor=4 if int(cli_args.num_workers) > 0 else None,
     )
-    writer = AsyncTargetCacheWriter(
+    writer = _create_writer(
         rank_dir=rank_dir,
         max_shard_bytes=int(cli_args.max_shard_bytes),
-        max_queue_size=int(cli_args.local_batch_size) * 4,
+        local_batch_size=int(cli_args.local_batch_size),
+        resume_samples=resume_samples,
+        resume_shard_files=resume_shard_files,
+    )
+    resume_tracker = _ResumeTracker(
+        rank_dir=rank_dir,
+        writer=writer,
+        resume_shard_count=len(resume_shard_files),
     )
 
     processed_local_samples = 0
+    local_remaining_samples = local_end - effective_start
     last_progress_printed = 0
+    start_time = time.perf_counter()
+
     try:
         with torch.no_grad():
             for batch_idx, batch in enumerate(dataloader):
                 processed_local_samples = min(
                     (batch_idx + 1) * int(cli_args.local_batch_size),
-                    local_total_samples,
+                    local_remaining_samples,
                 )
                 should_print_progress = (
                     processed_local_samples - last_progress_printed >= 100
-                    or processed_local_samples == local_total_samples
+                    or processed_local_samples == local_remaining_samples
                 )
                 if batch is None:
                     if should_print_progress:
@@ -298,6 +487,8 @@ def main(local_rank: int):
                             global_rank=global_rank,
                             processed_samples=processed_local_samples,
                             total_samples=local_total_samples,
+                            elapsed=time.perf_counter() - start_time,
+                            resumed_samples=resume_samples,
                         )
                         last_progress_printed = processed_local_samples
                     continue
@@ -311,6 +502,7 @@ def main(local_rank: int):
                     attention_mask=batch["attention_mask"],
                     target_layer_ids=target_layer_ids,
                 )
+
                 seq_lens = batch["attention_mask"].sum(dim=1).tolist()
                 for sample_idx_in_batch, seq_len in enumerate(seq_lens):
                     seq_len = int(seq_len)
@@ -327,25 +519,39 @@ def main(local_rank: int):
                             sample_idx_in_batch, :seq_len
                         ],
                     )
+
+                # Check if a shard boundary was crossed for checkpointing.
+                resume_tracker.checkpoint_if_shard_sealed()
+
                 if should_print_progress:
                     _print_prepare_progress(
                         global_rank=global_rank,
                         processed_samples=processed_local_samples,
                         total_samples=local_total_samples,
+                        elapsed=time.perf_counter() - start_time,
+                        resumed_samples=resume_samples,
                     )
                     last_progress_printed = processed_local_samples
     finally:
         writer.close()
+
     del target_model
     torch.cuda.empty_cache()
     dataset.close()
+
+    total_samples = writer.num_local_samples
+    all_shard_files = list(writer.writer.local_shard_files)
+
+    # Save final progress (all samples done).
+    _save_resume_progress(rank_dir, total_samples, all_shard_files)
+
     summary = LocalCacheWriteSummary(
         global_rank=global_rank,
         source_sample_start=local_start,
         source_sample_end=local_end,
-        num_local_samples=writer.num_local_samples,
-        num_local_shards=len(writer.local_shard_files),
-        local_shard_files=list(writer.local_shard_files),
+        num_local_samples=total_samples,
+        num_local_shards=len(all_shard_files),
+        local_shard_files=all_shard_files,
     )
     atomic_json_dump(summary.to_json(), os.path.join(rank_dir, "summary.json"))
     dist.barrier()
@@ -389,9 +595,11 @@ def main(local_rank: int):
             shards=shards,
         )
         cleanup_target_cache_tmp_dir(output_dir)
+        elapsed_total = time.perf_counter() - start_time
         print_on_global_main(
             f"Prepared target cache at {output_dir} with "
-            f"{num_valid_samples}/{len(dataset)} valid samples."
+            f"{num_valid_samples}/{len(dataset)} valid samples "
+            f"in {elapsed_total:.1f}s."
         )
     dist.barrier()
     dist.destroy_process_group()
