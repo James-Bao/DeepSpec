@@ -166,11 +166,6 @@ def parse_args():
         action="store_true",
         help="Resume from a previous interrupted run. Skips already-processed samples.",
     )
-    parser.add_argument(
-        "--compile",
-        action="store_true",
-        help="Apply torch.compile to the target model for faster forward passes.",
-    )
     cli_args = parser.parse_args()
     config = parse_opts_to_config(cli_args.opts, load_config(cli_args.config))
     return cli_args, config
@@ -366,7 +361,6 @@ def main(local_rank: int):
                 "local_batch_size": int(cli_args.local_batch_size),
                 "num_workers": int(cli_args.num_workers),
                 "resume": resuming,
-                "compile": bool(cli_args.compile),
             },
             indent=4,
         ),
@@ -431,10 +425,6 @@ def main(local_rank: int):
         dtype=torch.bfloat16,
         attn_implementation=attn_impl,
     ).to(device=device).eval()
-
-    if cli_args.compile:
-        print_on_local_main("Compiling target model with torch.compile...", flush=True)
-        target_model = torch.compile(target_model, mode="reduce-overhead")
 
     target_hidden_size = _get_target_hidden_size(target_model)
     train_collator = ConversationCollator(
