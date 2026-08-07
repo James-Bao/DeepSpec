@@ -17,11 +17,11 @@ import torch
 from deepspec.data.parser import preprocess_record
 
 
-TARGET_CACHE_VERSION = 2
+TARGET_CACHE_VERSION = 3
 INDEX_RECORD_STRUCT = struct.Struct("<QIIQQQQQ")
 INDEX_RECORD_SIZE = INDEX_RECORD_STRUCT.size
 
-TARGET_CACHE_HIDDEN_DTYPE = "bfloat16"
+TARGET_CACHE_HIDDEN_DTYPE = "float8_e4m3fn"
 TARGET_CACHE_TOKEN_DTYPE  = "int32"
 TARGET_CACHE_MASK_DTYPE   = "uint8"
 
@@ -69,8 +69,8 @@ def expected_target_cache_tensor_nbytes(
         "input_ids": numel["input_ids"] * 4,
         "attention_mask": numel["attention_mask"],
         "loss_mask": numel["loss_mask"],
-        "target_hidden_states": numel["target_hidden_states"] * 2,
-        "target_last_hidden_states": numel["target_last_hidden_states"] * 2,
+        "target_hidden_states": numel["target_hidden_states"],  # fp8: 1 byte/element
+        "target_last_hidden_states": numel["target_last_hidden_states"],
     }
 
 
@@ -223,9 +223,9 @@ def _tensor_to_bytes(tensor: torch.Tensor, dtype: torch.dtype):
     return cpu_tensor.numpy().tobytes()
 
 
-def _tensor_to_bfloat16_bytes(tensor: torch.Tensor):
-    cpu_tensor = tensor.detach().to(device="cpu", dtype=torch.bfloat16).contiguous()
-    return cpu_tensor.view(torch.uint16).numpy().tobytes()
+def _tensor_to_float8_bytes(tensor: torch.Tensor):
+    cpu_tensor = tensor.detach().to(device="cpu", dtype=torch.float8_e4m3fn).contiguous()
+    return cpu_tensor.view(torch.uint8).numpy().tobytes()
 
 
 def compute_local_sample_range(*, num_samples: int, rank: int, world_size: int):
@@ -295,8 +295,8 @@ def build_target_cache_sample_bytes(
         input_ids=_tensor_to_bytes(input_ids, torch.int32),
         attention_mask=_tensor_to_bytes(attention_mask, torch.uint8),
         loss_mask=_tensor_to_bytes(loss_mask, torch.uint8),
-        target_hidden_states=_tensor_to_bfloat16_bytes(target_hidden_states),
-        target_last_hidden_states=_tensor_to_bfloat16_bytes(
+        target_hidden_states=_tensor_to_float8_bytes(target_hidden_states),
+        target_last_hidden_states=_tensor_to_float8_bytes(
             target_last_hidden_states
         ),
     )
@@ -729,7 +729,7 @@ class CacheDataset(torch.utils.data.Dataset):
             tensor = tensor.to(dtype=torch_dtype)
         return tensor
 
-    def _read_bfloat16_tensor_from_shard(
+    def _read_float8_tensor_from_shard(
         self,
         *,
         shard_mmap,
@@ -743,12 +743,12 @@ class CacheDataset(torch.utils.data.Dataset):
         )
         array = np.frombuffer(
             shard_mmap,
-            dtype=np.uint16,
+            dtype=np.uint8,
             count=int(np.prod(shape)),
             offset=int(offset),
         ).copy()
-        tensor = torch.from_numpy(array).view(torch.bfloat16)
-        return tensor.view(*shape)
+        tensor = torch.from_numpy(array).view(torch.float8_e4m3fn)
+        return tensor.view(*shape).to(torch.bfloat16)
 
     def __getitem__(self, index: int):
         if not (0 <= int(index) < self.num_samples):
@@ -778,13 +778,13 @@ class CacheDataset(torch.utils.data.Dataset):
             torch_dtype=torch.uint8,
             nbytes=nbytes["loss_mask"],
         )
-        target_hidden_states = self._read_bfloat16_tensor_from_shard(
+        target_hidden_states = self._read_float8_tensor_from_shard(
             shard_mmap=shard_mmap,
             offset=record["target_hidden_states_offset"],
             shape=(seq_len, self.num_target_layers * self.hidden_size),
             nbytes=nbytes["target_hidden_states"],
         )
-        target_last_hidden_states = self._read_bfloat16_tensor_from_shard(
+        target_last_hidden_states = self._read_float8_tensor_from_shard(
             shard_mmap=shard_mmap,
             offset=record["target_last_hidden_states_offset"],
             shape=(seq_len, self.hidden_size),
